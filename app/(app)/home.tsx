@@ -9,16 +9,19 @@ import {
   onSnapshot,
   query,
   serverTimestamp,
-  updateDoc
+  updateDoc,
+  type QueryDocumentSnapshot,
+  type QuerySnapshot
 } from "firebase/firestore";
 import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, StyleSheet, Text, View } from 'react-native';
 import { auth, db } from '../../src/firebaseConfig';
+
 // Type definitions
 type Point = { lat: number; lng: number; };
 type TollZone = { id: string; name: string; coordinates: Point[]; toll_amount?: number; };
 
-// Helper function to calculate distance between two coordinates in meters
+// Helper function to calculate distance (displacement)
 const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
   const R = 6371e3; // metres
   const φ1 = (lat1 * Math.PI) / 180;
@@ -27,9 +30,10 @@ const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => 
   const Δλ = ((lon2 - lon1) * Math.PI) / 180;
   const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c; // in metres
+  return R * c;
 };
 
+// Helper function for geofencing
 const isPointInPolygon = (point: Point, polygon: Point[]) => {
   if (!polygon) return false;
   let isInside = false;
@@ -45,7 +49,7 @@ const isPointInPolygon = (point: Point, polygon: Point[]) => {
 };
 
 const HomeScreen = () => {
-  // State variables are the same
+  // State Management
   const [userName, setUserName] = useState('');
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
@@ -53,9 +57,11 @@ const HomeScreen = () => {
   const [tollZones, setTollZones] = useState<TollZone[]>([]);
   const [loading, setLoading] = useState(true);
   const [entryPoint, setEntryPoint] = useState<Location.LocationObject | null>(null);
-  
-  // Use a ref to store the previous location for filtering
-  const previousLocationRef = useRef<Location.LocationObject | null>(null);
+
+  // Refs for advanced logic
+  const locationHistoryRef = useRef<Location.LocationObject[]>([]);
+  const exitTimerRef = useRef<number | null>(null);
+
   // Effect to fetch user data (from Firestore)
   useEffect(() => {
     if (!auth.currentUser) return;
@@ -71,11 +77,8 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
-  // Use a ref to store the recent location points for averaging
-  const locationHistoryRef = useRef<Location.LocationObject[]>([]);
-
-  // UPDATED: useEffect for location tracking with smoothing
-   useEffect(() => {
+  // Effect for location tracking with smoothing
+  useEffect(() => {
     let subscriber: Location.LocationSubscription | null = null;
     const startLocationTracking = async () => {
       let { status } = await Location.requestForegroundPermissionsAsync();
@@ -84,41 +87,16 @@ const HomeScreen = () => {
         return;
       }
       subscriber = await Location.watchPositionAsync(
-        { 
-          accuracy: Location.Accuracy.BestForNavigation, 
-          // This is the fastest setting: check every 1 second
-          timeInterval: 1000, 
-          distanceInterval: 5,
-        },
+        { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 5 },
         (newLocation) => {
-          // --- Start of New Smoothing Logic ---
-          
-          // 1. Add the new location to our history
           locationHistoryRef.current.push(newLocation);
-          
-          // 2. Keep the history limited to the last 5 points
-          if (locationHistoryRef.current.length > 5) {
-            locationHistoryRef.current.shift(); // Removes the oldest point
+          if (locationHistoryRef.current.length > 3) {
+            locationHistoryRef.current.shift();
           }
-
-          // 3. Calculate the average of all points in the history
           const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
           const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
-
-          // 4. Create a new "smoothed" location object
-          const smoothedLocation = {
-            ...newLocation, // Copy other data like timestamp
-            coords: {
-              ...newLocation.coords, // Copy other data like accuracy
-              latitude: avgLat,
-              longitude: avgLng,
-            },
-          };
-          
-          // 5. Use the smoothed location to update the app's state
+          const smoothedLocation = { ...newLocation, coords: { ...newLocation.coords, latitude: avgLat, longitude: avgLng } };
           setLocation(smoothedLocation);
-
-          // --- End of New Smoothing Logic ---
         }
       );
     };
@@ -126,45 +104,29 @@ const HomeScreen = () => {
     return () => { if (subscriber) { subscriber.remove(); } };
   }, []);
 
-  // Effect to fetch toll zones (from firestore Database)
-   useEffect(() => {
-  const zonesCollectionRef = collection(db, "tollZones");
-  const q = query(zonesCollectionRef);
-
-  const unsubscribe = onSnapshot(q, (querySnapshot) => {
-    const loadedZones: TollZone[] = [];
-    querySnapshot.forEach((doc) => {
-      const data = doc.data();
-      // This line now checks for 'data.tollZones' OR 'data.coordinates'
-      const points = data.tollZones || data.coordinates; 
-
-      if (data && data.name && points && Array.isArray(points)) {
-        loadedZones.push({
-          id: doc.id,
-          name: data.name,
-          toll_amount: data.toll_amount,
-          coordinates: points 
-        });
-      } else {
-        console.warn(`Skipping malformed toll zone document with ID: ${doc.id}`);
-      }
+  // Effect to fetch toll zones (from Firestore)
+  useEffect(() => {
+    const zonesCollectionRef = collection(db, "tollZones");
+    const q = query(zonesCollectionRef);
+    const unsubscribe = onSnapshot(q, (querySnapshot: QuerySnapshot) => {
+      const loadedZones: TollZone[] = [];
+      querySnapshot.forEach((doc: QueryDocumentSnapshot) => {
+        const data = doc.data();
+        const points = data.tollZones || data.coordinates;
+        if (data && data.name && points && Array.isArray(points)) {
+          loadedZones.push({ id: doc.id, name: data.name, toll_amount: data.toll_amount, coordinates: points });
+        }
+      });
+      setTollZones(loadedZones);
     });
-    setTollZones(loadedZones);
-  });
+    return () => unsubscribe();
+  }, []);
 
-  return () => unsubscribe();
-}, []);
-
-    // NEW: A ref to hold the 20-second exit timer
-    const exitTimerRef = useRef<number | null>(null);
-
-   // UPDATED: Geofencing effect now handles the grace period
+  // Effect for geofencing with grace period
   useEffect(() => {
     if (!location || tollZones.length === 0) return;
-
     const currentLocation: Point = { lat: location.coords.latitude, lng: location.coords.longitude };
     let currentlyInZone: TollZone | null = null;
-
     for (const zone of tollZones) {
       if (isPointInPolygon(currentLocation, zone.coordinates)) {
         currentlyInZone = zone;
@@ -172,32 +134,25 @@ const HomeScreen = () => {
       }
     }
 
-    // Case 1: Just ENTERED a zone (or re-entered within the grace period)
-    if (currentlyInZone && currentlyInZone.id === (activeZone?.id || currentlyInZone.id)) {
-      // If an exit timer is running, cancel it because we've re-entered
+    if (currentlyInZone && (!activeZone || currentlyInZone.id === activeZone.id)) {
       if (exitTimerRef.current) {
         clearTimeout(exitTimerRef.current);
         exitTimerRef.current = null;
       }
-      
-      // If this is the first time entering, set the active zone and entry point
       if (!activeZone) {
         setActiveZone(currentlyInZone);
         setEntryPoint(location);
       }
-    } 
-    // Case 2: Just EXITED a zone
-    else if (!currentlyInZone && activeZone) {
-      // Don't charge immediately. Start a 20-second timer.
+    } else if (!currentlyInZone && activeZone) {
       if (!exitTimerRef.current) {
-        const exitLocation = location; // Capture the location at the moment of exit
-        exitTimerRef.current = setTimeout(() => {
-          // This code will run after 20 seconds IF the timer is not canceled
+        const exitLocation = location;
+        const timerId = setTimeout(() => {
           calculateAndChargeToll(entryPoint, exitLocation, activeZone);
           setActiveZone(null);
           setEntryPoint(null);
-          exitTimerRef.current = null; // Clear the timer ref
-        }, 20000); // 20000 milliseconds = 20 seconds
+          exitTimerRef.current = null;
+        }, 20000);
+        exitTimerRef.current = Number(timerId);
       }
     }
   }, [location, tollZones, activeZone, entryPoint]);
@@ -205,25 +160,17 @@ const HomeScreen = () => {
   const calculateAndChargeToll = async (entry: Location.LocationObject | null, exit: Location.LocationObject, zone: TollZone) => {
     if (!entry || !auth.currentUser) return;
     const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
-    const ratePerMeter = 50 / 20; // Your rule: ₹50 per 20 meters
-    const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter)); // Ensure toll is not negative
+    const ratePerMeter = 50 / 20;
+    const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
     if (walletBalance !== null && walletBalance - calculatedToll < 500) {
-      Alert.alert("Low Balance on Exit", `Toll of ₹${calculatedToll.toFixed(2)} could not be charged. Please add funds.`);
+      Alert.alert("Low Balance", `Toll of ₹${calculatedToll.toFixed(2)} could not be charged.`);
       return;
     }
     const userId = auth.currentUser.uid;
     const userDocRef = doc(db, "users", userId);
     await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
-    await addDoc(collection(db, "transactions"), {
-      userId,
-      zoneId: zone.id,
-      zoneName: zone.name,
-      amount: calculatedToll,
-      distance: `${distanceMeters.toFixed(0)} meters`,
-      type: 'debit',
-      timestamp: serverTimestamp()
-    });
-    Alert.alert("Toll Charged", `You traveled ${distanceMeters.toFixed(0)}m in ${zone.name}. A toll of ₹${calculatedToll.toFixed(2)} has been deducted.`);
+    await addDoc(collection(db, "transactions"), { userId, zoneId: zone.id, zoneName: zone.name, amount: calculatedToll, distance: `${distanceMeters.toFixed(0)}m`, type: 'debit', timestamp: serverTimestamp() });
+    Alert.alert("Toll Charged", `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(2)} has been deducted.`);
   };
 
   if (loading) {
