@@ -106,7 +106,7 @@ const HomeScreen = () => {
             );
 
             // If the jump is > 500 meters, clear the history
-            if (jumpDistance > 500) {
+            if (jumpDistance > 50) {
               locationHistoryRef.current = [];
             }
           }
