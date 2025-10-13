@@ -71,9 +71,11 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
-  // Effect for location tracking
-  // UPDATED: useEffect for location tracking with a filter
-  useEffect(() => {
+  // Use a ref to store the recent location points for averaging
+  const locationHistoryRef = useRef<Location.LocationObject[]>([]);
+
+  // UPDATED: useEffect for location tracking with smoothing
+   useEffect(() => {
     let subscriber: Location.LocationSubscription | null = null;
     const startLocationTracking = async () => {
       let { status } = await Location.requestForegroundPermissionsAsync();
@@ -84,31 +86,39 @@ const HomeScreen = () => {
       subscriber = await Location.watchPositionAsync(
         { 
           accuracy: Location.Accuracy.BestForNavigation, 
-          // 1. Increased Frequency: Check location more often for better responsiveness
-          timeInterval: 2000, // 2 seconds
-          distanceInterval: 5, // Update if moved 5 meters
+          // This is the fastest setting: check every 1 second
+          timeInterval: 1000, 
+          distanceInterval: 5,
         },
         (newLocation) => {
-          // 2. Location Filter Logic
-          if (previousLocationRef.current) {
-            const movementDistance = getDistance(
-              previousLocationRef.current.coords.latitude,
-              previousLocationRef.current.coords.longitude,
-              newLocation.coords.latitude,
-              newLocation.coords.longitude
-            );
-            
-            // Only accept the new location if:
-            // - The movement is significant (more than 10 meters)
-            // - The GPS accuracy is good (less than 50 meters error)
-            if (movementDistance < 10 || (newLocation.coords.accuracy != null && newLocation.coords.accuracy > 50)) {
-              return; // Ignore this update, it's likely just GPS jitter
-            }
+          // --- Start of New Smoothing Logic ---
+          
+          // 1. Add the new location to our history
+          locationHistoryRef.current.push(newLocation);
+          
+          // 2. Keep the history limited to the last 5 points
+          if (locationHistoryRef.current.length > 5) {
+            locationHistoryRef.current.shift(); // Removes the oldest point
           }
 
-          // If the location update is valid, update the state and the ref
-          setLocation(newLocation);
-          previousLocationRef.current = newLocation;
+          // 3. Calculate the average of all points in the history
+          const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
+          const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
+
+          // 4. Create a new "smoothed" location object
+          const smoothedLocation = {
+            ...newLocation, // Copy other data like timestamp
+            coords: {
+              ...newLocation.coords, // Copy other data like accuracy
+              latitude: avgLat,
+              longitude: avgLng,
+            },
+          };
+          
+          // 5. Use the smoothed location to update the app's state
+          setLocation(smoothedLocation);
+
+          // --- End of New Smoothing Logic ---
         }
       );
     };
@@ -145,24 +155,50 @@ const HomeScreen = () => {
   return () => unsubscribe();
 }, []);
 
-  // Effect for geofencing (handles ENTRY and EXIT)
+    // NEW: A ref to hold the 20-second exit timer
+    const exitTimerRef = useRef<number | null>(null);
+
+   // UPDATED: Geofencing effect now handles the grace period
   useEffect(() => {
     if (!location || tollZones.length === 0) return;
+
     const currentLocation: Point = { lat: location.coords.latitude, lng: location.coords.longitude };
     let currentlyInZone: TollZone | null = null;
+
     for (const zone of tollZones) {
       if (isPointInPolygon(currentLocation, zone.coordinates)) {
         currentlyInZone = zone;
         break;
       }
     }
-    if (currentlyInZone && !activeZone) {
-      setActiveZone(currentlyInZone);
-      setEntryPoint(location);
-    } else if (!currentlyInZone && activeZone) {
-      calculateAndChargeToll(entryPoint, location, activeZone);
-      setActiveZone(null);
-      setEntryPoint(null);
+
+    // Case 1: Just ENTERED a zone (or re-entered within the grace period)
+    if (currentlyInZone && currentlyInZone.id === (activeZone?.id || currentlyInZone.id)) {
+      // If an exit timer is running, cancel it because we've re-entered
+      if (exitTimerRef.current) {
+        clearTimeout(exitTimerRef.current);
+        exitTimerRef.current = null;
+      }
+      
+      // If this is the first time entering, set the active zone and entry point
+      if (!activeZone) {
+        setActiveZone(currentlyInZone);
+        setEntryPoint(location);
+      }
+    } 
+    // Case 2: Just EXITED a zone
+    else if (!currentlyInZone && activeZone) {
+      // Don't charge immediately. Start a 20-second timer.
+      if (!exitTimerRef.current) {
+        const exitLocation = location; // Capture the location at the moment of exit
+        exitTimerRef.current = setTimeout(() => {
+          // This code will run after 20 seconds IF the timer is not canceled
+          calculateAndChargeToll(entryPoint, exitLocation, activeZone);
+          setActiveZone(null);
+          setEntryPoint(null);
+          exitTimerRef.current = null; // Clear the timer ref
+        }, 20000); // 20000 milliseconds = 20 seconds
+      }
     }
   }, [location, tollZones, activeZone, entryPoint]);
 
