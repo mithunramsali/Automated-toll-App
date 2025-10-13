@@ -77,7 +77,7 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
-  // Effect for location tracking with smoothing
+  // UPDATED: useEffect for location tracking with Jump Detection
   useEffect(() => {
     let subscriber: Location.LocationSubscription | null = null;
     const startLocationTracking = async () => {
@@ -87,16 +87,50 @@ const HomeScreen = () => {
         return;
       }
       subscriber = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 5 },
+        { 
+          accuracy: Location.Accuracy.BestForNavigation, 
+          timeInterval: 1000,
+          distanceInterval: 5,
+        },
         (newLocation) => {
-          locationHistoryRef.current.push(newLocation);
-          if (locationHistoryRef.current.length > 3) {
-            locationHistoryRef.current.shift();
+          // --- Start of New Jump Detection & Smoothing Logic ---
+
+          // Check for a large jump in distance
+          if (locationHistoryRef.current.length > 0) {
+            const lastLocation = locationHistoryRef.current[locationHistoryRef.current.length - 1];
+            const jumpDistance = getDistance(
+              lastLocation.coords.latitude,
+              lastLocation.coords.longitude,
+              newLocation.coords.latitude,
+              newLocation.coords.longitude
+            );
+
+            // If the jump is > 500 meters, clear the history
+            if (jumpDistance > 500) {
+              locationHistoryRef.current = [];
+            }
           }
+          
+          // Add the new location to our history
+          locationHistoryRef.current.push(newLocation);
+          
+          // Keep the history limited (e.g., to the last 3 points)
+          if (locationHistoryRef.current.length > 3) {
+            locationHistoryRef.current.shift(); // Removes the oldest point
+          }
+
+          // Calculate the average of all points in the current history
           const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
           const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
+
+          // Create and set the new "smoothed" location
           const smoothedLocation = { ...newLocation, coords: { ...newLocation.coords, latitude: avgLat, longitude: avgLng } };
-          setLocation(smoothedLocation);
+          
+          if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
+            setLocation(smoothedLocation);
+          }
+
+          // --- End of New Logic ---
         }
       );
     };
