@@ -115,7 +115,7 @@ const HomeScreen = () => {
           locationHistoryRef.current.push(newLocation);
           
           // Keep the history limited (e.g., to the last 3 points)
-          if (locationHistoryRef.current.length > 2) {
+          if (locationHistoryRef.current.length > 7) {
             locationHistoryRef.current.shift(); // Removes the oldest point
           }
 
