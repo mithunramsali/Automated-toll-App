@@ -53,12 +53,15 @@ const HomeScreen = () => {
   const [userName, setUserName] = useState('');
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
-  const [activeZone, setActiveZone] = useState<TollZone | null>(null);
   const [tollZones, setTollZones] = useState<TollZone[]>([]);
   const [loading, setLoading] = useState(true);
+  
+  // States for advanced geofencing logic
+  const [physicallyInZone, setPhysicallyInZone] = useState<TollZone | null>(null); // For instant UI updates
+  const [tripZone, setTripZone] = useState<TollZone | null>(null); // For background trip logic
   const [entryPoint, setEntryPoint] = useState<Location.LocationObject | null>(null);
 
-  // Refs for advanced logic
+  // Refs for smoothing and timers
   const locationHistoryRef = useRef<Location.LocationObject[]>([]);
   const exitTimerRef = useRef<number | null>(null);
 
@@ -77,7 +80,7 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
-  // UPDATED: useEffect for location tracking with Jump Detection
+  // Effect for location tracking with smoothing
   useEffect(() => {
     let subscriber: Location.LocationSubscription | null = null;
     const startLocationTracking = async () => {
@@ -87,50 +90,19 @@ const HomeScreen = () => {
         return;
       }
       subscriber = await Location.watchPositionAsync(
-        { 
-          accuracy: Location.Accuracy.BestForNavigation, 
-          timeInterval: 1000,
-          distanceInterval: 5,
-        },
+        { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 5 },
         (newLocation) => {
-          // --- Start of New Jump Detection & Smoothing Logic ---
-
-          // Check for a large jump in distance
-          if (locationHistoryRef.current.length > 0) {
-            const lastLocation = locationHistoryRef.current[locationHistoryRef.current.length - 1];
-            const jumpDistance = getDistance(
-              lastLocation.coords.latitude,
-              lastLocation.coords.longitude,
-              newLocation.coords.latitude,
-              newLocation.coords.longitude
-            );
-
-            // If the jump is > 500 meters, clear the history
-            if (jumpDistance > 50) {
-              locationHistoryRef.current = [];
-            }
-          }
-          
-          // Add the new location to our history
           locationHistoryRef.current.push(newLocation);
-          
-          // Keep the history limited (e.g., to the last 3 points)
-          if (locationHistoryRef.current.length > 7) {
-            locationHistoryRef.current.shift(); // Removes the oldest point
+          if (locationHistoryRef.current.length > 3) {
+            locationHistoryRef.current.shift();
           }
-
-          // Calculate the average of all points in the current history
           const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
           const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
-
-          // Create and set the new "smoothed" location
           const smoothedLocation = { ...newLocation, coords: { ...newLocation.coords, latitude: avgLat, longitude: avgLng } };
           
           if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
             setLocation(smoothedLocation);
           }
-
-          // --- End of New Logic ---
         }
       );
     };
@@ -156,43 +128,47 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
-  // Effect for geofencing with grace period
+  // Effect that ONLY determines the physical zone status for the UI
   useEffect(() => {
     if (!location || tollZones.length === 0) return;
     const currentLocation: Point = { lat: location.coords.latitude, lng: location.coords.longitude };
-    let currentlyInZone: TollZone | null = null;
+    let currentZone: TollZone | null = null;
     for (const zone of tollZones) {
       if (isPointInPolygon(currentLocation, zone.coordinates)) {
-        currentlyInZone = zone;
+        currentZone = zone;
         break;
       }
     }
+    setPhysicallyInZone(currentZone);
+  }, [location, tollZones]);
 
-    if (currentlyInZone && (!activeZone || currentlyInZone.id === activeZone.id)) {
+  // Effect that manages the trip logic (entry, exit, and grace period)
+  useEffect(() => {
+    if (physicallyInZone) {
       if (exitTimerRef.current) {
         clearTimeout(exitTimerRef.current);
         exitTimerRef.current = null;
       }
-      if (!activeZone) {
-        setActiveZone(currentlyInZone);
+      if (!tripZone) {
+        setTripZone(physicallyInZone);
         setEntryPoint(location);
       }
-    } else if (!currentlyInZone && activeZone) {
+    } else if (!physicallyInZone && tripZone) {
       if (!exitTimerRef.current) {
         const exitLocation = location;
         const timerId = setTimeout(() => {
-          calculateAndChargeToll(entryPoint, exitLocation, activeZone);
-          setActiveZone(null);
+          calculateAndChargeToll(entryPoint, exitLocation, tripZone);
+          setTripZone(null);
           setEntryPoint(null);
           exitTimerRef.current = null;
         }, 20000);
         exitTimerRef.current = Number(timerId);
       }
     }
-  }, [location, tollZones, activeZone, entryPoint]);
+  }, [physicallyInZone]);
 
-  const calculateAndChargeToll = async (entry: Location.LocationObject | null, exit: Location.LocationObject, zone: TollZone) => {
-    if (!entry || !auth.currentUser) return;
+  const calculateAndChargeToll = async (entry: Location.LocationObject | null, exit: Location.LocationObject | null, zone: TollZone | null) => {
+    if (!entry || !exit || !zone || !auth.currentUser) return;
     const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
     const ratePerMeter = 50 / 20;
     const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
@@ -234,14 +210,14 @@ const HomeScreen = () => {
         </View>
       </View>
       <LinearGradient
-        colors={activeZone ? ['#FFD166', '#FFB703'] : ['#4DDE9B', '#34A853']}
+        colors={physicallyInZone ? ['#FFD166', '#FFB703'] : ['#4DDE9B', '#34A853']}
         style={styles.statusCard}
       >
-        {activeZone ? (
+        {physicallyInZone ? (
           <>
             <FontAwesome5 name="exclamation-circle" style={styles.icon} color="#fff" />
             <Text style={styles.title}>Entering Zone</Text>
-            <Text style={styles.zoneName}>{activeZone.name}</Text>
+            <Text style={styles.zoneName}>{physicallyInZone.name}</Text>
           </>
         ) : (
           <>
