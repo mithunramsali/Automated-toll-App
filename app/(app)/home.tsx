@@ -16,14 +16,15 @@ import {
   type QuerySnapshot
 } from "firebase/firestore";
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, AppState, StyleSheet, Text, View } from 'react-native';
 import { auth, db } from '../../src/firebaseConfig';
 
 // Type definitions
 type Point = { lat: number; lng: number; };
 type TollZone = { id: string; name: string; coordinates: Point[]; toll_amount?: number; };
 type PendingDeduction = { entry: Location.LocationObject; exit: Location.LocationObject; zone: TollZone; };
-
+// NEW: A type for our live GPS status
+type GpsStatus = 'Connected' | 'Searching...' | 'Disconnected' | 'Permission Denied';
 // NEW: Type for an offline transaction
 type OfflineTransaction = {
   userId: string;
@@ -75,6 +76,8 @@ const HomeScreen = () => {
   const [entryPoint, setEntryPoint] = useState<Location.LocationObject | null>(null);
   const [isOffline, setIsOffline] = useState(false); // NEW: State to track network
   const [pendingDeduction, setPendingDeduction] = useState<PendingDeduction | null>(null);
+  // NEW: Live GPS Status state
+  const [gpsStatus, setGpsStatus] = useState<GpsStatus>('Searching...');
   // Refs for smoothing and timers
   const locationHistoryRef = useRef<Location.LocationObject[]>([]);
   const exitTimerRef = useRef<number | null>(null);
@@ -203,6 +206,66 @@ const HomeScreen = () => {
     }
   }, [walletBalance, pendingDeduction]); // This hook runs every time the balance or pendingDeduction changes  
 
+  // --- NEW: Effect for Live GPS Service Monitoring ---
+  useEffect(() => {
+    const checkGpsStatus = async () => {
+      // 1. Check if the app has permission
+      const { status } = await Location.getForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        setGpsStatus('Permission Denied');
+        return;
+      }
+
+      // 2. Check if the phone's GPS hardware is turned on
+      const isGpsEnabled = await Location.hasServicesEnabledAsync();
+      
+      if (!isGpsEnabled) {
+        setGpsStatus('Disconnected');
+      } else if (location) {
+        setGpsStatus('Connected');
+      } else {
+        setGpsStatus('Searching...');
+      }
+    };
+
+    checkGpsStatus(); // Check immediately on load
+    const intervalId = setInterval(checkGpsStatus, 3000); // Re-check every 3 seconds
+    
+    // Also re-check when the app becomes active
+    const appStateSubscription = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState === 'active') {
+        checkGpsStatus();
+      }
+    });
+
+    return () => {
+      clearInterval(intervalId);
+      appStateSubscription.remove();
+    };
+  }, [location]); // Reruns this check logic every time 'location' updates too
+
+  // --- NEW: Effect to Handle Logic Based on GPS Status ---
+  useEffect(() => {
+    if (!auth.currentUser) return;
+
+    // 1. Pop up an alert if GPS is turned off inside a toll zone
+    if (physicallyInZone && gpsStatus === 'Disconnected') {
+      Alert.alert(
+        "GPS is Off",
+        "Your GPS is turned off. Please turn on your device's location to ensure accurate toll tracking.",
+        [{ text: "OK" }]
+      );
+    }
+    
+    // 2. Store the GPS status in Firebase
+    const userDocRef = doc(db, "users", auth.currentUser.uid);
+    updateDoc(userDocRef, {
+      // --- THIS IS THE UPDATED LINE ---
+      gpsStatusInZone: physicallyInZone ? gpsStatus : 'not needed'
+    });
+
+  }, [physicallyInZone, gpsStatus]); // This runs every time your zone or GPS status changes
+  
   // --- NEW: Effect to listen for network changes ---
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener(state => {
