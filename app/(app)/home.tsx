@@ -1,4 +1,6 @@
 import { FontAwesome5 } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from "@react-native-community/netinfo";
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Location from 'expo-location';
 import {
@@ -20,6 +22,17 @@ import { auth, db } from '../../src/firebaseConfig';
 // Type definitions
 type Point = { lat: number; lng: number; };
 type TollZone = { id: string; name: string; coordinates: Point[]; toll_amount?: number; };
+type PendingDeduction = { entry: Location.LocationObject; exit: Location.LocationObject; zone: TollZone; };
+
+// NEW: Type for an offline transaction
+type OfflineTransaction = {
+  userId: string;
+  zoneId: string;
+  zoneName: string;
+  amount: number;
+  distance: string;
+  timestamp: Date;
+};
 
 // Helper function to calculate distance (displacement)
 const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
@@ -60,7 +73,8 @@ const HomeScreen = () => {
   const [physicallyInZone, setPhysicallyInZone] = useState<TollZone | null>(null); // For instant UI updates
   const [tripZone, setTripZone] = useState<TollZone | null>(null); // For background trip logic
   const [entryPoint, setEntryPoint] = useState<Location.LocationObject | null>(null);
-
+  const [isOffline, setIsOffline] = useState(false); // NEW: State to track network
+  const [pendingDeduction, setPendingDeduction] = useState<PendingDeduction | null>(null);
   // Refs for smoothing and timers
   const locationHistoryRef = useRef<Location.LocationObject[]>([]);
   const exitTimerRef = useRef<number | null>(null);
@@ -167,6 +181,61 @@ const HomeScreen = () => {
     }
   }, [physicallyInZone]);
 
+  // --- NEW: Effect to listen for network changes ---
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const isCurrentlyOffline = !state.isConnected || !state.isInternetReachable;
+      setIsOffline(isCurrentlyOffline);
+
+      // When the app comes back ONLINE
+      if (isCurrentlyOffline === false) {
+        console.log("App is back online. Syncing offline transactions...");
+        syncOfflineTransactions();
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // --- NEW: Function to sync offline transactions ---
+  const syncOfflineTransactions = async () => {
+    if (!auth.currentUser) return;
+    try {
+      // 1. Get saved transactions from local storage
+      const savedTxs = await AsyncStorage.getItem('offlineTransactions');
+      if (savedTxs === null) return; // No transactions to sync
+
+      const transactions: OfflineTransaction[] = JSON.parse(savedTxs);
+      const userId = auth.currentUser.uid;
+      const userDocRef = doc(db, "users", userId);
+
+      // 2. Loop and upload each transaction
+      for (const tx of transactions) {
+        // A. Deduct amount from wallet
+        await updateDoc(userDocRef, { walletBalance: increment(-tx.amount) });
+        
+        // B. Add the transaction to the history
+        await addDoc(collection(db, "transactions"), {
+          userId: tx.userId,
+          zoneId: tx.zoneId,
+          zoneName: tx.zoneName,
+          amount: tx.amount,
+          distance: tx.distance,
+          type: 'debit',
+          // Convert the saved date string back to a Firebase timestamp
+          timestamp: new Date(tx.timestamp), 
+        });
+        
+        console.log(`Successfully synced offline transaction for ${tx.zoneName}`);
+      }
+
+      // 3. Clear the local storage
+      await AsyncStorage.removeItem('offlineTransactions');
+    } catch (e) {
+      console.error("Failed to sync offline transactions:", e);
+    }
+  };
+
   const calculateAndChargeToll = async (entry: Location.LocationObject | null, exit: Location.LocationObject | null, zone: TollZone | null) => {
     if (!entry || !exit || !zone || !auth.currentUser) return;
     const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
@@ -177,10 +246,45 @@ const HomeScreen = () => {
       return;
     }
     const userId = auth.currentUser.uid;
-    const userDocRef = doc(db, "users", userId);
-    await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
-    await addDoc(collection(db, "transactions"), { userId, zoneId: zone.id, zoneName: zone.name, amount: calculatedToll, distance: `${distanceMeters.toFixed(0)}m`, type: 'debit', timestamp: serverTimestamp() });
-    Alert.alert("Toll Charged", `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(2)} has been deducted.`);
+    // --- Start of New Offline/Online Logic ---
+    if (isOffline) {
+      // --- OFFLINE LOGIC ---
+      Alert.alert(
+        "Offline: Toll Saved", 
+        `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(2)} will be deducted when you reconnect to the internet.`
+      );
+      
+      const newOfflineTx: OfflineTransaction = {
+        userId,
+        zoneId: zone.id,
+        zoneName: zone.name,
+        amount: calculatedToll,
+        distance: `${distanceMeters.toFixed(0)}m`,
+        timestamp: new Date(), // Save the current time
+      };
+
+      // Save this transaction to the phone's local storage
+      const existingTxs = await AsyncStorage.getItem('offlineTransactions');
+      const txs = existingTxs ? JSON.parse(existingTxs) : [];
+      txs.push(newOfflineTx);
+      await AsyncStorage.setItem('offlineTransactions', JSON.stringify(txs));
+
+    } else {
+      // --- ONLINE LOGIC (same as before) ---
+      if (walletBalance !== null && walletBalance - calculatedToll < 500) {
+        Alert.alert(
+          "Low Balance", 
+          `Toll of ₹${calculatedToll.toFixed(2)} could not be charged. This amount will be deducted automatically once your balance is sufficient.`
+        );
+        setPendingDeduction({ entry, exit, zone });
+        return;
+      }
+      
+      const userDocRef = doc(db, "users", userId);
+      await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
+      await addDoc(collection(db, "transactions"), { userId, zoneId: zone.id, zoneName: zone.name, amount: calculatedToll, distance: `${distanceMeters.toFixed(0)}m`, type: 'debit', timestamp: serverTimestamp() });
+      Alert.alert("Toll Charged", `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(2)} has been deducted.`);
+    }
   };
 
   if (loading) {
