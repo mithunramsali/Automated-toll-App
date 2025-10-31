@@ -97,7 +97,7 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
-  // Effect for location tracking with smoothing
+  // --- UPDATED: Effect for location tracking with Conditional Smoothing & Jump Detection ---
   useEffect(() => {
     let subscriber: Location.LocationSubscription | null = null;
     const startLocationTracking = async () => {
@@ -109,23 +109,48 @@ const HomeScreen = () => {
       subscriber = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 5 },
         (newLocation) => {
-          locationHistoryRef.current.push(newLocation);
-          if (locationHistoryRef.current.length > 3) {
-            locationHistoryRef.current.shift();
-          }
-          const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
-          const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
-          const smoothedLocation = { ...newLocation, coords: { ...newLocation.coords, latitude: avgLat, longitude: avgLng } };
           
-          if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
-            setLocation(smoothedLocation);
+          // --- Start of Conditional Logic ---
+          if (physicallyInZone) {
+            // If INSIDE a zone, use RAW location for a fast exit.
+            if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
+              setLocation(newLocation);
+            }
+          } else {
+            // If OUTSIDE a zone, use SMOOTHED location with JUMP DETECTION.
+            
+            // Jump Detection
+            if (locationHistoryRef.current.length > 0) {
+              const lastLocation = locationHistoryRef.current[locationHistoryRef.current.length - 1];
+              const jumpDistance = getDistance(
+                lastLocation.coords.latitude, lastLocation.coords.longitude,
+                newLocation.coords.latitude, newLocation.coords.longitude
+              );
+              if (jumpDistance > 500) {
+                locationHistoryRef.current = [];
+              }
+            }
+            
+            // Smoothing Logic
+            locationHistoryRef.current.push(newLocation);
+            if (locationHistoryRef.current.length > 7) { // Using 7 points as requested
+              locationHistoryRef.current.shift();
+            }
+            const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
+            const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
+            const smoothedLocation = { ...newLocation, coords: { ...newLocation.coords, latitude: avgLat, longitude: avgLng } };
+            
+            if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
+              setLocation(smoothedLocation);
+            }
           }
+          // --- End of Conditional Logic ---
         }
       );
     };
     startLocationTracking();
     return () => { if (subscriber) { subscriber.remove(); } };
-  }, []);
+  }, [physicallyInZone]); // Rerun this logic if zone status changes
 
   // Effect to fetch toll zones (from Firestore)
   useEffect(() => {
