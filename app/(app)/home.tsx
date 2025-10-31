@@ -181,6 +181,28 @@ const HomeScreen = () => {
     }
   }, [physicallyInZone]);
 
+  // --- This is the complete useEffect hook for pending deductions ---
+  useEffect(() => {
+    // Run only if a deduction is pending AND we have a valid wallet balance
+    if (pendingDeduction && walletBalance) {
+      const { entry, exit, zone } = pendingDeduction;
+      
+      // Re-calculate the toll amount
+      const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
+      const ratePerMeter = 50 / 20;
+      const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
+
+      // Check if the new balance is now sufficient
+      if (walletBalance - calculatedToll >= 500) {
+        // If yes, process the charge
+        calculateAndChargeToll(entry, exit, zone);
+        
+        // Clear the pending deduction so it doesn't run again
+        setPendingDeduction(null);
+      }
+    }
+  }, [walletBalance, pendingDeduction]); // This hook runs every time the balance or pendingDeduction changes  
+
   // --- NEW: Effect to listen for network changes ---
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener(state => {
