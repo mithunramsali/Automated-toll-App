@@ -97,6 +97,18 @@ const HomeScreen = () => {
     return () => unsubscribe();
   }, []);
 
+   // Load any saved pending deduction 🔧
+  useEffect(() => {
+    const loadPendingDeduction = async () => {
+      const saved = await AsyncStorage.getItem('pendingDeduction');
+      if (saved) {
+        console.log("Loaded pending deduction from storage:", saved);
+        setPendingDeduction(JSON.parse(saved));
+      }
+    };
+    loadPendingDeduction();
+  }, []);
+
   // --- UPDATED: Effect for location tracking with Conditional Smoothing & Jump Detection ---
   useEffect(() => {
     let subscriber: Location.LocationSubscription | null = null;
@@ -208,28 +220,33 @@ const HomeScreen = () => {
       }
     }
   }, [physicallyInZone]);
-
+  // This hook runs every time the balance or pendingDeduction changes
   // --- This is the complete useEffect hook for pending deductions ---
   useEffect(() => {
-    // Run only if a deduction is pending AND we have a valid wallet balance
-    if (pendingDeduction && walletBalance) {
-      const { entry, exit, zone } = pendingDeduction;
-      
-      // Re-calculate the toll amount
-      const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
-      const ratePerMeter = 50 / 20;
-      const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
+    const processPending = async () => {
+      if (pendingDeduction && walletBalance && !isOffline) {
+        const { entry, exit, zone } = pendingDeduction;
+        const distanceMeters = getDistance(
+          entry.coords.latitude,
+          entry.coords.longitude,
+          exit.coords.latitude,
+          exit.coords.longitude
+        );
+        const ratePerMeter = 50 / 20;
+        const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
 
-      // Check if the new balance is now sufficient
-      if (walletBalance - calculatedToll >= 500) {
-        // If yes, process the charge
-        calculateAndChargeToll(entry, exit, zone);
-        
-        // Clear the pending deduction so it doesn't run again
-        setPendingDeduction(null);
+        if (walletBalance - calculatedToll >= 500) {
+          console.log("Processing stored pending deduction...");
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await calculateAndChargeToll(entry, exit, zone);
+          setPendingDeduction(null);
+          await AsyncStorage.removeItem('pendingDeduction');
+        }
       }
-    }
-  }, [walletBalance, pendingDeduction]); // This hook runs every time the balance or pendingDeduction changes  
+    };
+    processPending();
+  }, [walletBalance, pendingDeduction, isOffline]);
+     
 
   // --- NEW: Effect for Live GPS Service Monitoring ---
   useEffect(() => {
@@ -351,10 +368,6 @@ const HomeScreen = () => {
     const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
     const ratePerMeter = 50 / 20;
     const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
-    if (walletBalance !== null && walletBalance - calculatedToll < 500) {
-      Alert.alert("Low Balance", `Toll of ₹${calculatedToll.toFixed(2)} could not be charged.`);
-      return;
-    }
     const userId = auth.currentUser.uid;
     // --- Start of New Offline/Online Logic ---
     if (isOffline) {
@@ -382,13 +395,16 @@ const HomeScreen = () => {
     } else {
       // --- ONLINE LOGIC (same as before) ---
       if (walletBalance !== null && walletBalance - calculatedToll < 500) {
-        Alert.alert(
-          "Low Balance", 
-          `Toll of ₹${calculatedToll.toFixed(2)} could not be charged. This amount will be deducted automatically once your balance is sufficient.`
-        );
-        setPendingDeduction({ entry, exit, zone });
+        Alert.alert("Low Balance", `Toll of ₹${calculatedToll.toFixed(2)} could not be charged. This amount will be deducted automatically once your balance is sufficient.`);
+
+        if (!pendingDeduction) {
+          const newPending = { entry, exit, zone };
+          setPendingDeduction(newPending);
+          await AsyncStorage.setItem('pendingDeduction', JSON.stringify(newPending));
+        }
         return;
       }
+
       
       const userDocRef = doc(db, "users", userId);
       await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
