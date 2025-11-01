@@ -419,7 +419,8 @@ const HomeScreen = () => {
           <FontAwesome5 name="map-marker-alt" size={20} color="#666" style={styles.infoIcon} />
            <View>
              <Text style={styles.infoLabel}>GPS Status</Text>
-             <Text style={styles.infoValue}>{location ? 'Connected' : 'Searching...'}</Text>
+             <Text style={styles.infoValue}>{gpsStatus}</Text>
+
            </View>
         </View>
       </View>
