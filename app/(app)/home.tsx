@@ -7,17 +7,24 @@ import {
   addDoc,
   collection,
   doc,
+  endAt,      // <-- ADDED
+  getDocs,
   increment,
+  limit,
   onSnapshot,
+  orderBy,    // <-- ADDED
   query,
   serverTimestamp,
+  startAt,    // <-- ADDED
   updateDoc,
+  where,
   type QueryDocumentSnapshot,
   type QuerySnapshot
 } from "firebase/firestore";
 import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, AppState, StyleSheet, Text, View } from 'react-native';
 import { auth, db } from '../../src/firebaseConfig';
+import { geohashQueryBounds, distanceBetween } from 'geofire-common';
 
 // Type definitions
 type Point = { lat: number; lng: number; };
@@ -165,22 +172,59 @@ const HomeScreen = () => {
   }, [physicallyInZone]); // Rerun this logic if zone status changes
 
   // Effect to fetch toll zones (from Firestore)
-  useEffect(() => {
-    const zonesCollectionRef = collection(db, "tollZones");
-    const q = query(zonesCollectionRef);
-    const unsubscribe = onSnapshot(q, (querySnapshot: QuerySnapshot) => {
-      const loadedZones: TollZone[] = [];
-      querySnapshot.forEach((doc: QueryDocumentSnapshot) => {
-        const data = doc.data();
-        const points = data.tollZones || data.coordinates;
-        if (data && data.name && points && Array.isArray(points)) {
-          loadedZones.push({ id: doc.id, name: data.name, toll_amount: data.toll_amount, coordinates: points });
+  // --- THIS IS THE NEW, FAST HOOK ---
+useEffect(() => {
+    // This function will be triggered whenever the user's location changes significantly
+    const fetchNearbyTollZones = async (locationObject: Location.LocationObject) => {
+        if (!locationObject) return;
+
+        const center: [number, number] = [locationObject.coords.latitude, locationObject.coords.longitude];
+        // Set a radius in meters for how far to search for toll zones.
+        const radiusInM = 50 * 1000; // 50 kilometers
+
+        // Get the geohash query boundaries for this radius
+        const bounds = geohashQueryBounds(center, radiusInM);
+        const promises = [];
+
+        for (const b of bounds) {
+            const q = query(
+                collection(db, "tollZones"),
+                orderBy("geohash"),
+                startAt(b[0]),
+                endAt(b[1])
+            );
+            promises.push(getDocs(q));
         }
-      });
-      setTollZones(loadedZones);
-    });
-    return () => unsubscribe();
-  }, []);
+
+        // Wait for all the queries to complete
+        const snapshots = await Promise.all(promises);
+        const matchingDocs: TollZone[] = [];
+
+        for (const snap of snapshots) {
+            for (const doc of snap.docs) {
+                const data = doc.data();
+                const points = data.tollZones || data.coordinates;
+                // You may need to find the center of your polygon here for accurate distance check
+                // For simplicity, we assume a 'center' field or use the first coordinate
+                const zoneCenter = data.center || (points ? [points[0].lat, points[0].lng] : null);
+
+                if (zoneCenter) {
+                    // Final check: Is the document *really* within the radius?
+                    const distanceInKm = distanceBetween(center, zoneCenter);
+                    if (distanceInKm * 1000 <= radiusInM) {
+                        matchingDocs.push({ id: doc.id, name: data.name, toll_amount: data.toll_amount, coordinates: points });
+                    }
+                }
+            }
+        }
+        setTollZones(matchingDocs);
+    };
+
+    // We only want to fetch zones once we have a valid location.
+    if (location) {
+        fetchNearbyTollZones(location);
+    }
+}, [location]); // This effect now re-runs if the user's location changes.
 
   // Effect that ONLY determines the physical zone status for the UI
   useEffect(() => {
@@ -266,27 +310,70 @@ const HomeScreen = () => {
     };
   }, [location]); // Reruns this check logic every time 'location' updates too
 
-  // --- NEW: Effect to Handle Logic Based on GPS Status ---
+// --- THIS IS THE NEW, ENHANCED HOOK ---
   useEffect(() => {
+    // Exit if the user is not logged in.
     if (!auth.currentUser) return;
 
-    // 1. Pop up an alert if GPS is turned off inside a toll zone
-    if (physicallyInZone && gpsStatus === 'Disconnected') {
-      Alert.alert(
-        "GPS is Off",
-        "Your GPS is turned off. Please turn on your device's location to ensure accurate toll tracking.",
-        [{ text: "OK" }]
-      );
-    }
-    
-    // 2. Store the GPS status in Firebase
     const userDocRef = doc(db, "users", auth.currentUser.uid);
+    
+    // This part always keeps the user's GPS status in their profile up-to-date.
     updateDoc(userDocRef, {
-      // --- THIS IS THE UPDATED LINE ---
       gpsStatusInZone: physicallyInZone ? gpsStatus : 'not needed'
     });
 
-  }, [physicallyInZone, gpsStatus]); // This runs every time your zone or GPS status changes
+    // This is the critical scenario: GPS was working but has just disconnected while the user is inside a toll zone.
+    if (physicallyInZone && gpsStatus === 'Disconnected' && location) {
+      Alert.alert(
+        "GPS Signal Lost",
+        "Your device's location was turned off. Tolls will now be calculated using cameras as a fallback.",
+        [{ text: "OK" }]
+      );
+
+      // This async function finds the active trip and updates it for the hybrid scenario.
+      const saveLastGpsLocation = async () => {
+        try {
+          // Find the active trip for this user in this specific zone.
+          const tripsRef = collection(db, "vehicle_trips");
+          const q = query(
+            tripsRef,
+            where("userId", "==", auth.currentUser?.uid),
+            where("tollZoneId", "==", physicallyInZone.id),
+            where("status", "==", "active"),
+            limit(1)
+          );
+
+          const querySnapshot = await getDocs(q);
+
+          // If an active trip is found, update it.
+          if (!querySnapshot.empty) {
+            const activeTripDoc = querySnapshot.docs[0];
+            const tripDocRef = doc(db, "vehicle_trips", activeTripDoc.id);
+            
+            console.log(`GPS lost: Saving last known location to trip ${activeTripDoc.id}`);
+            
+            // Update the trip document with the last good location coordinates and timestamps.
+            await updateDoc(tripDocRef, {
+              lastKnownGpsLocation: {
+                lat: location.coords.latitude,
+                lng: location.coords.longitude,
+              },
+              lastGpsUpdateTimestamp: serverTimestamp(),
+              calculationMethod: "HYBRID" // Mark for the backend to use hybrid logic
+            });
+          }
+        } catch (error) {
+          console.error("Failed to save last known GPS location:", error);
+        }
+      };
+
+      saveLastGpsLocation();
+    }
+
+  // THE FIX: 'location' is now included in the dependency array.
+  // This ensures the hook re-runs whenever the zone, GPS status, OR location changes,
+  // preventing stale data bugs.
+  }, [physicallyInZone, gpsStatus, location]); // This runs every time your zone or GPS status changes
   
   // --- NEW: Effect to listen for network changes ---
   useEffect(() => {
