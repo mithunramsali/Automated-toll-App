@@ -142,10 +142,10 @@ exports.calculateTollOnSighting = onDocumentUpdated({
 
         console.log(`Segment toll for trip ${tripId}: ₹${segmentToll.toFixed(2)}. New total: ₹${newTotalToll.toFixed(2)}.`);
 
-        // Update the trip with the newly calculated toll.
+        
         await tripRef.update({
             totalToll: newTotalToll,
-            // Mark that this segment was calculated by the backend.
+         
             calculationMethod: "ANPR",
         });
     }

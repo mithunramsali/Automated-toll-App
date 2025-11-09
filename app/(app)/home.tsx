@@ -7,15 +7,15 @@ import {
   addDoc,
   collection,
   doc,
-  endAt,      // <-- ADDED
+  endAt,
   getDocs,
   increment,
   limit,
   onSnapshot,
-  orderBy,    // <-- ADDED
+  orderBy,
   query,
   serverTimestamp,
-  startAt,    // <-- ADDED
+  startAt,
   updateDoc,
   where,
   type QueryDocumentSnapshot,
@@ -30,9 +30,7 @@ import { geohashQueryBounds, distanceBetween } from 'geofire-common';
 type Point = { lat: number; lng: number; };
 type TollZone = { id: string; name: string; coordinates: Point[]; toll_amount?: number; };
 type PendingDeduction = { entry: Location.LocationObject; exit: Location.LocationObject; zone: TollZone; };
-// NEW: A type for our live GPS status
 type GpsStatus = 'Connected' | 'Searching...' | 'Disconnected' | 'Permission Denied';
-// NEW: Type for an offline transaction
 type OfflineTransaction = {
   userId: string;
   zoneId: string;
@@ -81,13 +79,15 @@ const HomeScreen = () => {
   const [physicallyInZone, setPhysicallyInZone] = useState<TollZone | null>(null); // For instant UI updates
   const [tripZone, setTripZone] = useState<TollZone | null>(null); // For background trip logic
   const [entryPoint, setEntryPoint] = useState<Location.LocationObject | null>(null);
-  const [isOffline, setIsOffline] = useState(false); // NEW: State to track network
+  const [isOffline, setIsOffline] = useState(false);
   const [pendingDeduction, setPendingDeduction] = useState<PendingDeduction | null>(null);
-  // NEW: Live GPS Status state
   const [gpsStatus, setGpsStatus] = useState<GpsStatus>('Searching...');
+
   // Refs for smoothing and timers
   const locationHistoryRef = useRef<Location.LocationObject[]>([]);
   const exitTimerRef = useRef<number | null>(null);
+  // <-- NEW: Ref to track the last location where we fetched zones
+  const lastZoneFetchLocationRef = useRef<Location.LocationObject | null>(null);
 
   // Effect to fetch user data (from Firestore)
   useEffect(() => {
@@ -138,21 +138,23 @@ const HomeScreen = () => {
           } else {
             // If OUTSIDE a zone, use SMOOTHED location with JUMP DETECTION.
             
-            // Jump Detection
+            // --- UPDATED: Jump Detection (Scenario 2) ---
             if (locationHistoryRef.current.length > 0) {
               const lastLocation = locationHistoryRef.current[locationHistoryRef.current.length - 1];
               const jumpDistance = getDistance(
                 lastLocation.coords.latitude, lastLocation.coords.longitude,
                 newLocation.coords.latitude, newLocation.coords.longitude
               );
-              if (jumpDistance > 500) {
+              // <-- UPDATED: Changed from 500m to 100m to match your scenario
+              if (jumpDistance > 100) { 
+                console.warn(`GPS Jump detected (${jumpDistance.toFixed(0)}m). Resetting smoothing buffer.`);
                 locationHistoryRef.current = [];
               }
             }
             
             // Smoothing Logic
             locationHistoryRef.current.push(newLocation);
-            if (locationHistoryRef.current.length > 7) { // Using 7 points as requested
+            if (locationHistoryRef.current.length > 7) { 
               locationHistoryRef.current.shift();
             }
             const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
@@ -169,20 +171,18 @@ const HomeScreen = () => {
     };
     startLocationTracking();
     return () => { if (subscriber) { subscriber.remove(); } };
-  }, [physicallyInZone]); // Rerun this logic if zone status changes
+  }, [physicallyInZone]); 
 
   // Effect to fetch toll zones (from Firestore)
-  // --- THIS IS THE NEW, FAST HOOK ---
-useEffect(() => {
+  // --- UPDATED: This hook is now optimized for Scenario 2 ---
+  useEffect(() => {
     // This function will be triggered whenever the user's location changes significantly
     const fetchNearbyTollZones = async (locationObject: Location.LocationObject) => {
         if (!locationObject) return;
 
         const center: [number, number] = [locationObject.coords.latitude, locationObject.coords.longitude];
-        // Set a radius in meters for how far to search for toll zones.
         const radiusInM = 50 * 1000; // 50 kilometers
 
-        // Get the geohash query boundaries for this radius
         const bounds = geohashQueryBounds(center, radiusInM);
         const promises = [];
 
@@ -196,7 +196,6 @@ useEffect(() => {
             promises.push(getDocs(q));
         }
 
-        // Wait for all the queries to complete
         const snapshots = await Promise.all(promises);
         const matchingDocs: TollZone[] = [];
 
@@ -204,13 +203,18 @@ useEffect(() => {
             for (const doc of snap.docs) {
                 const data = doc.data();
                 const points = data.tollZones || data.coordinates;
-                // You may need to find the center of your polygon here for accurate distance check
-                // For simplicity, we assume a 'center' field or use the first coordinate
-                const zoneCenter = data.center || (points ? [points[0].lat, points[0].lng] : null);
+                
+                // --- FIX from previous error ---
+                let zoneCenterArray: [number, number] | null = null;
+                if (data.center && data.center.lat != null && data.center.lng != null) {
+                    zoneCenterArray = [data.center.lat, data.center.lng];
+                } else if (points && points.length > 0) {
+                    zoneCenterArray = [points[0].lat, points[0].lng];
+                }
+                // --- End of Fix ---
 
-                if (zoneCenter) {
-                    // Final check: Is the document *really* within the radius?
-                    const distanceInKm = distanceBetween(center, zoneCenter);
+                if (zoneCenterArray) {
+                    const distanceInKm = distanceBetween(center, zoneCenterArray);
                     if (distanceInKm * 1000 <= radiusInM) {
                         matchingDocs.push({ id: doc.id, name: data.name, toll_amount: data.toll_amount, coordinates: points });
                     }
@@ -218,13 +222,35 @@ useEffect(() => {
             }
         }
         setTollZones(matchingDocs);
+        // <-- NEW: Update the ref so we know the location of the last successful fetch
+        lastZoneFetchLocationRef.current = locationObject;
     };
 
-    // We only want to fetch zones once we have a valid location.
+    // --- NEW: Logic for Scenario 2 (Efficient Fetching) ---
     if (location) {
-        fetchNearbyTollZones(location);
+        const FETCH_THRESHOLD_METERS = 500; // Only fetch new zones if user moves 500m
+        
+        if (!lastZoneFetchLocationRef.current) {
+            // Case 1: First time loading, fetch immediately
+            console.log("First time fetching nearby zones.");
+            fetchNearbyTollZones(location);
+        } else {
+            // Case 2: Check distance from last fetch
+            const distanceMoved = getDistance(
+              lastZoneFetchLocationRef.current.coords.latitude,
+              lastZoneFetchLocationRef.current.coords.longitude,
+              location.coords.latitude,
+              location.coords.longitude
+            );
+            
+            if (distanceMoved > FETCH_THRESHOLD_METERS) {
+              console.log(`User moved ${distanceMoved.toFixed(0)}m. Fetching new zones.`);
+              fetchNearbyTollZones(location);
+            }
+            // Else: User hasn't moved far enough. Do nothing.
+        }
     }
-}, [location]); // This effect now re-runs if the user's location changes.
+  }, [location]); // This effect still runs on location change, but now has an internal check
 
   // Effect that ONLY determines the physical zone status for the UI
   useEffect(() => {
@@ -240,7 +266,7 @@ useEffect(() => {
     setPhysicallyInZone(currentZone);
   }, [location, tollZones]);
 
-  // Effect that manages the trip logic (entry, exit, and grace period)
+  // Effect that manages the trip logic (entry, exit, and grace period) - (Scenario 1)
   useEffect(() => {
     if (physicallyInZone) {
       if (exitTimerRef.current) {
@@ -263,9 +289,9 @@ useEffect(() => {
         exitTimerRef.current = Number(timerId);
       }
     }
-  }, [physicallyInZone]);
-  // This hook runs every time the balance or pendingDeduction changes
-  // --- This is the complete useEffect hook for pending deductions ---
+  }, [physicallyInZone]); // <-- This dependency array is correct
+
+  // Effect for pending deductions
   useEffect(() => {
     const processPending = async () => {
       if (pendingDeduction && walletBalance && !isOffline) {
@@ -291,18 +317,14 @@ useEffect(() => {
     processPending();
   }, [walletBalance, pendingDeduction, isOffline]);
      
-
-  // --- NEW: Effect for Live GPS Service Monitoring ---
+  // Effect for Live GPS Service Monitoring
   useEffect(() => {
     const checkGpsStatus = async () => {
-      // 1. Check if the app has permission
       const { status } = await Location.getForegroundPermissionsAsync();
       if (status !== 'granted') {
         setGpsStatus('Permission Denied');
         return;
       }
-
-      // 2. Check if the phone's GPS hardware is turned on
       const isGpsEnabled = await Location.hasServicesEnabledAsync();
       
       if (!isGpsEnabled) {
@@ -314,10 +336,8 @@ useEffect(() => {
       }
     };
 
-    checkGpsStatus(); // Check immediately on load
-    const intervalId = setInterval(checkGpsStatus, 3000); // Re-check every 3 seconds
-    
-    // Also re-check when the app becomes active
+    checkGpsStatus(); 
+    const intervalId = setInterval(checkGpsStatus, 3000); 
     const appStateSubscription = AppState.addEventListener('change', (nextAppState) => {
       if (nextAppState === 'active') {
         checkGpsStatus();
@@ -328,32 +348,25 @@ useEffect(() => {
       clearInterval(intervalId);
       appStateSubscription.remove();
     };
-  }, [location]); // Reruns this check logic every time 'location' updates too
+  }, [location]); 
 
-// --- THIS IS THE NEW, ENHANCED HOOK ---
+  // Effect for Hybrid GPS-to-ANPR Handover (Scenario 4)
   useEffect(() => {
-    // Exit if the user is not logged in.
     if (!auth.currentUser) return;
-
     const userDocRef = doc(db, "users", auth.currentUser.uid);
     
-    // This part always keeps the user's GPS status in their profile up-to-date.
     updateDoc(userDocRef, {
       gpsStatusInZone: physicallyInZone ? gpsStatus : 'not needed'
     });
 
-    // This is the critical scenario: GPS was working but has just disconnected while the user is inside a toll zone.
     if (physicallyInZone && gpsStatus === 'Disconnected' && location) {
       Alert.alert(
         "GPS Signal Lost",
         "Your device's location was turned off. Tolls will now be calculated using cameras as a fallback.",
         [{ text: "OK" }]
       );
-
-      // This async function finds the active trip and updates it for the hybrid scenario.
       const saveLastGpsLocation = async () => {
         try {
-          // Find the active trip for this user in this specific zone.
           const tripsRef = collection(db, "vehicle_trips");
           const q = query(
             tripsRef,
@@ -362,73 +375,57 @@ useEffect(() => {
             where("status", "==", "active"),
             limit(1)
           );
-
           const querySnapshot = await getDocs(q);
 
-          // If an active trip is found, update it.
           if (!querySnapshot.empty) {
             const activeTripDoc = querySnapshot.docs[0];
             const tripDocRef = doc(db, "vehicle_trips", activeTripDoc.id);
-            
             console.log(`GPS lost: Saving last known location to trip ${activeTripDoc.id}`);
             
-            // Update the trip document with the last good location coordinates and timestamps.
             await updateDoc(tripDocRef, {
-              lastKnownGpsLocation: {
+              lastKnownGGpsLocation: {
                 lat: location.coords.latitude,
                 lng: location.coords.longitude,
               },
               lastGpsUpdateTimestamp: serverTimestamp(),
-              calculationMethod: "HYBRID" // Mark for the backend to use hybrid logic
+              calculationMethod: "HYBRID" 
             });
           }
         } catch (error) {
           console.error("Failed to save last known GPS location:", error);
         }
       };
-
       saveLastGpsLocation();
     }
-
-  // THE FIX: 'location' is now included in the dependency array.
-  // This ensures the hook re-runs whenever the zone, GPS status, OR location changes,
-  // preventing stale data bugs.
-  }, [physicallyInZone, gpsStatus, location]); // This runs every time your zone or GPS status changes
+  }, [physicallyInZone, gpsStatus, location]);
   
-  // --- NEW: Effect to listen for network changes ---
+  // Effect to listen for network changes
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener(state => {
       const isCurrentlyOffline = !state.isConnected || !state.isInternetReachable;
       setIsOffline(isCurrentlyOffline);
 
-      // When the app comes back ONLINE
       if (isCurrentlyOffline === false) {
         console.log("App is back online. Syncing offline transactions...");
         syncOfflineTransactions();
       }
     });
-
     return () => unsubscribe();
   }, []);
 
-  // --- NEW: Function to sync offline transactions ---
+  // Function to sync offline transactions
   const syncOfflineTransactions = async () => {
     if (!auth.currentUser) return;
     try {
-      // 1. Get saved transactions from local storage
       const savedTxs = await AsyncStorage.getItem('offlineTransactions');
-      if (savedTxs === null) return; // No transactions to sync
+      if (savedTxs === null) return; 
 
       const transactions: OfflineTransaction[] = JSON.parse(savedTxs);
       const userId = auth.currentUser.uid;
       const userDocRef = doc(db, "users", userId);
 
-      // 2. Loop and upload each transaction
       for (const tx of transactions) {
-        // A. Deduct amount from wallet
         await updateDoc(userDocRef, { walletBalance: increment(-tx.amount) });
-        
-        // B. Add the transaction to the history
         await addDoc(collection(db, "transactions"), {
           userId: tx.userId,
           zoneId: tx.zoneId,
@@ -436,27 +433,24 @@ useEffect(() => {
           amount: tx.amount,
           distance: tx.distance,
           type: 'debit',
-          // Convert the saved date string back to a Firebase timestamp
           timestamp: new Date(tx.timestamp), 
         });
-        
         console.log(`Successfully synced offline transaction for ${tx.zoneName}`);
       }
-
-      // 3. Clear the local storage
       await AsyncStorage.removeItem('offlineTransactions');
     } catch (e) {
       console.error("Failed to sync offline transactions:", e);
     }
   };
 
+  // Main toll calculation function (Scenario 1)
   const calculateAndChargeToll = async (entry: Location.LocationObject | null, exit: Location.LocationObject | null, zone: TollZone | null) => {
     if (!entry || !exit || !zone || !auth.currentUser) return;
     const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
     const ratePerMeter = 50 / 20;
     const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
     const userId = auth.currentUser.uid;
-    // --- Start of New Offline/Online Logic ---
+    
     if (isOffline) {
       // --- OFFLINE LOGIC ---
       Alert.alert(
@@ -470,17 +464,16 @@ useEffect(() => {
         zoneName: zone.name,
         amount: calculatedToll,
         distance: `${distanceMeters.toFixed(0)}m`,
-        timestamp: new Date(), // Save the current time
+        timestamp: new Date(), 
       };
 
-      // Save this transaction to the phone's local storage
       const existingTxs = await AsyncStorage.getItem('offlineTransactions');
       const txs = existingTxs ? JSON.parse(existingTxs) : [];
       txs.push(newOfflineTx);
       await AsyncStorage.setItem('offlineTransactions', JSON.stringify(txs));
 
     } else {
-      // --- ONLINE LOGIC (same as before) ---
+      // --- ONLINE LOGIC ---
       if (walletBalance !== null && walletBalance - calculatedToll < 500) {
         Alert.alert("Low Balance", `Toll of ₹${calculatedToll.toFixed(2)} could not be charged. This amount will be deducted automatically once your balance is sufficient.`);
 
@@ -491,7 +484,6 @@ useEffect(() => {
         }
         return;
       }
-
       
       const userDocRef = doc(db, "users", userId);
       await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
