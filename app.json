@@ -2,10 +2,7 @@
   "expo": {
     "name": "AutomatedTollApp",
     "slug": "AutomatedTollApp",
-    "platforms": [
-      "ios",
-      "android"
-    ],
+    "platforms": ["ios", "android"],
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -29,6 +26,11 @@
         }
       }
     },
+    "extra": {
+      "eas": {
+        "projectId": "a8e97bbf-4135-4918-a303-66d59ab83220"
+      }
+    },
     "web": {
       "output": "static",
       "favicon": "./assets/images/favicon.png"
@@ -46,8 +48,7 @@
             "backgroundColor": "#000000"
           }
         }
-      ],
-      "expo-web-browser"
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
@@ -58,12 +59,6 @@
     },
     "updates": {
       "url": "https://u.expo.dev/a8e97bbf-4135-4918-a303-66d59ab83220"
-    },
-    "extra": {
-      "router": {},
-      "eas": {
-        "projectId": "4edfe97e-19e6-4e0d-b43e-17363dd56388"
-      }
     }
   }
 }
