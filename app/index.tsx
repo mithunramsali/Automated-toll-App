@@ -1,7 +1,8 @@
 import { FontAwesome5 } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Link } from 'expo-router';
-import { signInWithEmailAndPassword } from 'firebase/auth';
+// Import the new function from firebase/auth
+import { sendPasswordResetEmail, signInWithEmailAndPassword } from 'firebase/auth';
 import React, { useState } from 'react';
 import {
   ActivityIndicator,
@@ -34,6 +35,23 @@ const LoginScreen = () => {
       // The root layout will handle navigation on successful login
     } catch (error: any) {
       Alert.alert('Login Error', error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- NEW FUNCTION: Handle Forgot Password ---
+  const handleForgotPassword = async () => {
+    if (!email) {
+      Alert.alert('Forgot Password', 'Please enter your email address in the email field first.');
+      return;
+    }
+    setLoading(true);
+    try {
+      await sendPasswordResetEmail(auth, email);
+      Alert.alert('Password Reset', 'A password reset link has been successfully sent to your email.');
+    } catch (error: any) {
+      Alert.alert('Error', error.message);
     } finally {
       setLoading(false);
     }
@@ -86,6 +104,12 @@ const LoginScreen = () => {
                 />
               </TouchableOpacity>
             </View>
+
+            {/* --- NEW FORGOT PASSWORD LINK --- */}
+            <TouchableOpacity onPress={handleForgotPassword} style={styles.forgotPasswordContainer} disabled={loading}>
+              <Text style={styles.forgotPasswordText}>Forgot Password?</Text>
+            </TouchableOpacity>
+
           </View>
 
           <TouchableOpacity style={styles.buttonWrapper} onPress={handleLogin} disabled={loading}>
@@ -116,6 +140,7 @@ const LoginScreen = () => {
   );
 };
 
+// --- STYLES (with new styles added) ---
 const styles = StyleSheet.create({
   gradientBackground: {
     flex: 1,
@@ -185,6 +210,18 @@ const styles = StyleSheet.create({
     color: '#2b3b52',
     fontSize: 16,
   },
+  // --- NEW STYLES FOR FORGOT PASSWORD ---
+  forgotPasswordContainer: {
+    width: '100%',
+    alignItems: 'flex-end',
+    marginBottom: 15,
+  },
+  forgotPasswordText: {
+    color: '#4a76ff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  // --- END NEW STYLES ---
   buttonWrapper: {
     width: '100%',
     borderRadius: 15,

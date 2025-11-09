@@ -127,7 +127,42 @@ const HomeScreen = () => {
       subscriber = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 5 },
         (newLocation) => {
-          setRawLocation(newLocation);
+          
+          // --- Start of Conditional Logic ---
+          if (physicallyInZone) {
+            // If INSIDE a zone, use RAW location for a fast exit.
+            if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
+              setLocation(newLocation);
+            }
+          } else {
+            // If OUTSIDE a zone, use SMOOTHED location with JUMP DETECTION.
+            
+            // Jump Detection
+            if (locationHistoryRef.current.length > 0) {
+              const lastLocation = locationHistoryRef.current[locationHistoryRef.current.length - 1];
+              const jumpDistance = getDistance(
+                lastLocation.coords.latitude, lastLocation.coords.longitude,
+                newLocation.coords.latitude, newLocation.coords.longitude
+              );
+              if (jumpDistance > 70) {
+                locationHistoryRef.current = [];
+              }
+            }
+            
+            // Smoothing Logic
+            locationHistoryRef.current.push(newLocation);
+            if (locationHistoryRef.current.length > 3) { // Using 3 points as requested
+              locationHistoryRef.current.shift();
+            }
+            const avgLat = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.latitude, 0) / locationHistoryRef.current.length;
+            const avgLng = locationHistoryRef.current.reduce((sum, loc) => sum + loc.coords.longitude, 0) / locationHistoryRef.current.length;
+            const smoothedLocation = { ...newLocation, coords: { ...newLocation.coords, latitude: avgLat, longitude: avgLng } };
+            
+            if (newLocation.coords.accuracy != null && newLocation.coords.accuracy < 75) {
+              setLocation(smoothedLocation);
+            }
+          }
+          // --- End of Conditional Logic ---
         }
       );
     };
@@ -357,23 +392,9 @@ const HomeScreen = () => {
 
   // --- 6. This hook handles pending deductions ---
   useEffect(() => {
-    const processPending = async () => {
-      if (pendingDeduction && walletBalance && !isOffline) {
-        const { entry, exit, zone } = pendingDeduction;
-        const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
-        const ratePerMeter = 50 / 20;
-        const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
-        if (walletBalance - calculatedToll >= 500) {
-          console.log("Processing stored pending deduction...");
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          await calculateAndChargeToll(entry, exit, zone);
-          setPendingDeduction(null);
-          await AsyncStorage.removeItem('pendingDeduction');
-        }
-      }
-    };
-    processPending();
-  }, [walletBalance, pendingDeduction, isOffline]);
+  processPendingDeduction();
+}, [walletBalance, isOffline]);
+
      
   // --- 7. This hook monitors the phone's GPS hardware status ---
   useEffect(() => {
@@ -492,47 +513,106 @@ const HomeScreen = () => {
     }
   };
 
-  const calculateAndChargeToll = async (entry: Location.LocationObject | null, exit: Location.LocationObject | null, zone: TollZone | null) => {
-    if (!entry || !exit || !zone || !auth.currentUser) return;
-    const distanceMeters = getDistance(entry.coords.latitude, entry.coords.longitude, exit.coords.latitude, exit.coords.longitude);
+  const calculateAndChargeToll = async (
+  entry: Location.LocationObject | null,
+  exit: Location.LocationObject | null,
+  zone: TollZone | null
+) => {
+  if (!entry || !exit || !zone || !auth.currentUser) return;
+
+  const distanceMeters = getDistance(
+    entry.coords.latitude,
+    entry.coords.longitude,
+    exit.coords.latitude,
+    exit.coords.longitude
+  );
+  const ratePerMeter = 50 / 20;
+  const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
+  const userId = auth.currentUser.uid;
+
+  // 🚨 Check if wallet balance is 0 or not enough
+  if (!walletBalance || walletBalance < calculatedToll) {
+    Alert.alert(
+      "Low Balance",
+      `Your wallet balance is too low. Toll of ₹${calculatedToll.toFixed(
+        2
+      )} could not be charged. It will be deducted automatically once you recharge.`
+    );
+
+    // Save this as a pending deduction for later processing
+    const newPending = { entry, exit, zone };
+    setPendingDeduction(newPending);
+    await AsyncStorage.setItem("pendingDeduction", JSON.stringify(newPending));
+    return;
+  }
+
+  // --- Start of Offline/Online Logic ---
+  if (isOffline) {
+    // --- OFFLINE LOGIC ---
+    Alert.alert(
+      "Offline: Toll Saved",
+      `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(
+        2
+      )} will be deducted when you reconnect to the internet.`
+    );
+
+    const newOfflineTx: OfflineTransaction = {
+      userId,
+      zoneId: zone.id,
+      zoneName: zone.name,
+      amount: calculatedToll,
+      distance: `${distanceMeters.toFixed(0)}m`,
+      timestamp: new Date(),
+    };
+
+    const existingTxs = await AsyncStorage.getItem("offlineTransactions");
+    const txs = existingTxs ? JSON.parse(existingTxs) : [];
+    txs.push(newOfflineTx);
+    await AsyncStorage.setItem("offlineTransactions", JSON.stringify(txs));
+  } else {
+    // --- ONLINE LOGIC ---
+    const userDocRef = doc(db, "users", userId);
+    await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
+    await addDoc(collection(db, "transactions"), {
+      userId,
+      zoneId: zone.id,
+      zoneName: zone.name,
+      amount: calculatedToll,
+      distance: `${distanceMeters.toFixed(0)}m`,
+      type: "debit",
+      timestamp: serverTimestamp(),
+    });
+
+    Alert.alert(
+      "Toll Charged",
+      `You traveled ${distanceMeters.toFixed(
+        0
+      )}m. A toll of ₹${calculatedToll.toFixed(2)} has been deducted.`
+    );
+  }
+};
+// --- Helper: Process Pending Deduction if wallet is recharged ---
+const processPendingDeduction = async () => {
+  if (pendingDeduction && walletBalance && !isOffline) {
+    const { entry, exit, zone } = pendingDeduction;
+    const distanceMeters = getDistance(
+      entry.coords.latitude,
+      entry.coords.longitude,
+      exit.coords.latitude,
+      exit.coords.longitude
+    );
     const ratePerMeter = 50 / 20;
     const calculatedToll = Math.max(0, Math.round(distanceMeters * ratePerMeter));
-    const userId = auth.currentUser.uid;
 
-    if (isOffline) {
-      Alert.alert(
-        "Offline: Toll Saved", 
-        `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(2)} will be deducted when you reconnect.`
-      );
-      const newOfflineTx: OfflineTransaction = {
-        userId,
-        zoneId: zone.id,
-        zoneName: zone.name,
-        amount: calculatedToll,
-        distance: `${distanceMeters.toFixed(0)}m`,
-        timestamp: new Date(),
-      };
-      const existingTxs = await AsyncStorage.getItem('offlineTransactions');
-      const txs = existingTxs ? JSON.parse(existingTxs) : [];
-      txs.push(newOfflineTx);
-      await AsyncStorage.setItem('offlineTransactions', JSON.stringify(txs));
-
-    } else {
-      if (walletBalance !== null && walletBalance - calculatedToll < 500) {
-        Alert.alert("Low Balance", `Toll of ₹${calculatedToll.toFixed(2)} could not be charged. This amount will be deducted automatically once your balance is sufficient.`);
-        if (!pendingDeduction) {
-          const newPending = { entry, exit, zone };
-          setPendingDeduction(newPending);
-          await AsyncStorage.setItem('pendingDeduction', JSON.stringify(newPending));
-        }
-        return;
-      }
-      const userDocRef = doc(db, "users", userId);
-      await updateDoc(userDocRef, { walletBalance: increment(-calculatedToll) });
-      await addDoc(collection(db, "transactions"), { userId, zoneId: zone.id, zoneName: zone.name, amount: calculatedToll, distance: `${distanceMeters.toFixed(0)}m`, type: 'debit', timestamp: serverTimestamp(),calculationMethod: 'GPS' });
-      Alert.alert("Toll Charged", `You traveled ${distanceMeters.toFixed(0)}m. A toll of ₹${calculatedToll.toFixed(2)} has been deducted.`);
+    if (walletBalance >= calculatedToll) {
+      console.log("✅ Processing stored pending deduction after recharge...");
+      await calculateAndChargeToll(entry, exit, zone);
+      setPendingDeduction(null);
+      await AsyncStorage.removeItem("pendingDeduction");
     }
-  };
+  }
+};
+
 
   if (loading) {
     return <ActivityIndicator size="large" style={styles.loader} />;
